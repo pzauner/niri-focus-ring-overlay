@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 import threading
+import os
 
 import gi
 import cairo
@@ -29,6 +30,9 @@ DMS_COLORS_KDL = Path.home() / ".config" / "niri" / "dms" / "colors.kdl"
 NIRI_CONFIG = Path.home() / ".config" / "niri" / "config.kdl"
 THEME_REFRESH_MS = 1000
 WATCHDOG_MS = 2000
+PROBE_MS = 50
+PROBE_WINDOW_MS = 2200
+DEBUG_LOG = Path.home() / ".cache" / "niri-focus-ring-debug.log"
 
 
 def run_json(args):
@@ -76,6 +80,19 @@ def parse_layout_tile(window):
         return None
     try:
         return (int(pos[0]), int(pos[1]), float(size[0]), float(size[1]))
+    except Exception:
+        return None
+
+
+def parse_layout_view_pos(window):
+    layout = window.get("layout") if isinstance(window, dict) else None
+    if not isinstance(layout, dict):
+        return None
+    p = layout.get("tile_pos_in_workspace_view")
+    if not isinstance(p, (list, tuple)) or len(p) < 2 or p[0] is None or p[1] is None:
+        return None
+    try:
+        return (float(p[0]), float(p[1]))
     except Exception:
         return None
 
@@ -232,11 +249,24 @@ class FocusRing:
         self.active_frame_ms = FRAME_MS
         self.idle_frame_ms = IDLE_FRAME_MS
         self._last_anim_ms = int(time.monotonic() * 1000)
+        self._last_event_name = "startup"
+        self._probe_until_ms = 0
+        self._last_debug_ms = 0
+        self.debug_enabled = os.environ.get("NIRI_FOCUS_RING_DEBUG", "1") not in ("0", "false", "False")
         self.visible = True
+
+        if self.debug_enabled:
+            try:
+                DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with DEBUG_LOG.open("a", encoding="utf-8") as f:
+                    f.write(f"\n=== start {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n")
+            except Exception:
+                pass
 
         self.full_snapshot()
         self.start_event_stream()
         GLib.timeout_add(WATCHDOG_MS, self.watchdog_tick)
+        GLib.timeout_add(PROBE_MS, self.probe_tick)
         GLib.timeout_add(FRAME_MS, self.animate)
 
     def on_realize(self, widget):
@@ -339,6 +369,20 @@ class FocusRing:
         except Exception:
             pass
 
+    def dlog(self, msg):
+        if not self.debug_enabled:
+            return
+        try:
+            now_ms = int(time.monotonic() * 1000)
+            # Avoid spamming identical hot paths too fast.
+            if now_ms - self._last_debug_ms < 25 and msg.startswith("geom "):
+                return
+            self._last_debug_ms = now_ms
+            with DEBUG_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
     def schedule_snapshot(self, delay_ms=40):
         if self._snapshot_pending:
             return
@@ -398,7 +442,10 @@ class FocusRing:
             if not isinstance(ev, dict) or not ev:
                 return False
             name = next(iter(ev.keys()))
+            self._last_event_name = name
+            self._probe_until_ms = int(time.monotonic() * 1000) + PROBE_WINDOW_MS
             payload = ev.get(name) or {}
+            self.dlog(f"event {name}")
             if name == "WorkspacesChanged":
                 ws = payload.get("workspaces")
                 if isinstance(ws, list):
@@ -410,6 +457,57 @@ class FocusRing:
                 if isinstance(wins, list):
                     self.cached_windows = wins
                 self.recompute_target()
+                return False
+            if name == "WindowLayoutsChanged":
+                if self.apply_window_layout_changes(payload):
+                    self.recompute_target()
+                else:
+                    self.dlog(f"event WindowLayoutsChanged no-apply keys={list(payload.keys()) if isinstance(payload, dict) else type(payload)}")
+                    self.schedule_snapshot(25)
+                return False
+            if name == "WindowOpenedOrChanged":
+                if self.apply_window_opened_or_changed(payload):
+                    self.recompute_target()
+                else:
+                    self.schedule_snapshot(20)
+                return False
+            if name == "WindowClosed":
+                if self.apply_window_closed(payload):
+                    self.recompute_target()
+                else:
+                    self.schedule_snapshot(20)
+                return False
+            if name == "WorkspaceActiveWindowChanged":
+                ws_id = payload.get("workspace_id")
+                awid = payload.get("active_window_id")
+                changed = False
+                if ws_id is not None:
+                    for ws in self.cached_workspaces:
+                        if ws.get("id") == ws_id:
+                            if ws.get("active_window_id") != awid:
+                                ws["active_window_id"] = awid
+                                changed = True
+                            break
+                if changed:
+                    self.recompute_target()
+                else:
+                    self.schedule_snapshot(20)
+                return False
+            if name == "WindowFocusChanged":
+                fid = payload.get("id")
+                changed = False
+                for w in self.cached_windows:
+                    want = (w.get("id") == fid) if fid is not None else False
+                    if bool(w.get("is_focused")) != want:
+                        w["is_focused"] = want
+                        changed = True
+                if changed:
+                    self.recompute_target()
+                else:
+                    self.schedule_snapshot(15)
+                return False
+            if name == "WorkspaceActivated":
+                self.schedule_snapshot(20)
                 return False
             if name == "OverviewOpenedOrClosed":
                 self._overview_is_open = bool(payload.get("is_open", False))
@@ -425,6 +523,71 @@ class FocusRing:
         except Exception:
             self.schedule_snapshot(80)
         return False
+
+    def apply_window_layout_changes(self, payload):
+        # Accept multiple payload shapes to stay compatible across niri versions.
+        entries = []
+        if isinstance(payload, dict):
+            for key in ("changes", "layouts", "window_layouts", "windows"):
+                val = payload.get(key)
+                if isinstance(val, list):
+                    for e in val:
+                        if isinstance(e, dict):
+                            entries.append(e)
+                            continue
+                        # niri currently sends changes as tuple-like arrays:
+                        # [[window_id, {layout...}], ...]
+                        if (
+                            isinstance(e, (list, tuple))
+                            and len(e) == 2
+                            and isinstance(e[0], int)
+                            and isinstance(e[1], dict)
+                        ):
+                            entries.append({"id": e[0], "layout": e[1]})
+            if isinstance(payload.get("id"), int) and isinstance(payload.get("layout"), dict):
+                entries.append({"id": payload.get("id"), "layout": payload.get("layout")})
+        if not entries:
+            return False
+
+        by_id = {w.get("id"): w for w in self.cached_windows if isinstance(w, dict)}
+        changed = False
+        for e in entries:
+            wid = e.get("id")
+            lay = e.get("layout")
+            if wid is None or not isinstance(lay, dict):
+                continue
+            w = by_id.get(wid)
+            if w is None:
+                continue
+            w["layout"] = lay
+            changed = True
+        return changed
+
+    def apply_window_opened_or_changed(self, payload):
+        if not isinstance(payload, dict):
+            return False
+        w = payload.get("window")
+        if not isinstance(w, dict):
+            return False
+        wid = w.get("id")
+        if wid is None:
+            return False
+        for i, old in enumerate(self.cached_windows):
+            if old.get("id") == wid:
+                self.cached_windows[i] = w
+                return True
+        self.cached_windows.append(w)
+        return True
+
+    def apply_window_closed(self, payload):
+        if not isinstance(payload, dict):
+            return False
+        wid = payload.get("id")
+        if wid is None:
+            return False
+        old_len = len(self.cached_windows)
+        self.cached_windows = [w for w in self.cached_windows if w.get("id") != wid]
+        return len(self.cached_windows) != old_len
 
     def recompute_target(self):
         try:
@@ -489,6 +652,7 @@ class FocusRing:
                 self._needs_redraw = True
             self.visible = True
             col_idx, row_idx, fw, fh = parsed_focused
+            focused_id = focused.get("id")
 
             out_logical = out.get("logical", {})
             wx, wy, ww, wh = self.get_workarea_for_output(out_logical)
@@ -512,6 +676,26 @@ class FocusRing:
             wh = max(1.0, wh - (bt + bb + st + sb))
 
             ws_id = focused.get("workspace_id")
+
+            # Prefer exact compositor-provided tile position if present.
+            # This path is crucial for smooth updates while horizontally panning
+            # when the focused tile can stay visible across multiple viewports.
+            view_pos = parse_layout_view_pos(focused)
+            if view_pos is not None:
+                # tile_pos_in_workspace_view is already in workspace-view coordinates,
+                # so do not add workarea/bar/strut insets again.
+                tx = view_pos[0] - PADDING
+                ty = view_pos[1] - PADDING
+                tw = fw + 2.0 * PADDING
+                th = fh + 2.0 * PADDING
+                self.target = [tx, ty, tw, th]
+                self._needs_redraw = True
+                self.dlog(
+                    f"geom path=tile_pos ev={self._last_event_name} wid={focused_id} ws={ws_id} "
+                    f"pos={col_idx},{row_idx} tile={fw:.1f}x{fh:.1f} tile_pos={view_pos[0]:.1f},{view_pos[1]:.1f} "
+                    f"target={tx:.1f},{ty:.1f},{tw:.1f},{th:.1f}"
+                )
+                return True
 
             # Workspace columns for horizontal math.
             same_ws = [w for w in windows if w.get("workspace_id") == ws_id and not w.get("is_floating")]
@@ -578,11 +762,48 @@ class FocusRing:
             th = fh + 2.0 * PADDING
             self.target = [tx, ty, tw, th]
             self._needs_redraw = True
+            self.dlog(
+                f"geom path=heuristic ev={self._last_event_name} wid={focused_id} ws={ws_id} "
+                f"pos={col_idx},{row_idx} tile={fw:.1f}x{fh:.1f} scroll_x={(self.scroll_x or 0.0):.1f} "
+                f"target={tx:.1f},{ty:.1f},{tw:.1f},{th:.1f}"
+            )
         except Exception:
             # Keep timer alive even if niri returns transient unexpected state.
             if self.visible:
                 self._needs_redraw = True
             self.visible = False
+            self.dlog("geom exception")
+        return True
+
+    def probe_tick(self):
+        # During likely touchpad panning phases, fetch focused-window layout
+        # directly. This catches viewport updates that may arrive without
+        # a full WindowsChanged event.
+        now = int(time.monotonic() * 1000)
+        if now <= self._probe_until_ms and not self._overview_is_open:
+            try:
+                fw = run_json(["niri", "msg", "--json", "focused-window"])
+                fid = fw.get("id")
+                if fid is not None:
+                    changed = False
+                    for i, old in enumerate(self.cached_windows):
+                        if old.get("id") == fid:
+                            old_layout = old.get("layout")
+                            new_layout = fw.get("layout")
+                            old_ws = old.get("workspace_id")
+                            new_ws = fw.get("workspace_id")
+                            if old_layout != new_layout or old_ws != new_ws or not old.get("is_focused", False):
+                                self.cached_windows[i] = fw
+                                changed = True
+                            break
+                    else:
+                        self.cached_windows.append(fw)
+                        changed = True
+                    if changed:
+                        self._last_event_name = "probe-focused-window"
+                        self.recompute_target()
+            except Exception:
+                pass
         return True
 
     def watchdog_tick(self):
