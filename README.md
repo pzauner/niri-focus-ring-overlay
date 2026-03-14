@@ -41,8 +41,38 @@ systemctl --user daemon-reload
 ## Notes
 
 - Tested with niri `25.11`.
-- This project uses heuristics because niri IPC currently returns `tile_pos_in_workspace_view: null` in this setup.
 - If your bar/struts differ, geometry may need tuning.
+
+## Required niri patch
+
+For pixel-accurate tracking during horizontal workspace-view panning, this overlay expects
+`layout.tile_pos_in_workspace_view` to be populated for tiled windows in the scrolling layout.
+
+On upstream `25.11`, this field may be `null` for scrolling tiles. In that case the overlay falls
+back to heuristics, which is less reliable.
+
+Patch applied in our setup:
+
+- `niri/src/layout/scrolling.rs`
+- function: `tiles_with_ipc_layouts()`
+- set `WindowLayout.tile_pos_in_workspace_view` from current view-space tile coordinates.
+
+Minimal flow to build and install patched niri:
+
+```bash
+cd ~/gits/GitHub/niri
+cargo build --release
+sudo install -Dm755 /usr/bin/niri /usr/bin/niri.backup.pre-ipc-tilepos
+sudo install -m755 ./target/release/niri /usr/bin/niri
+```
+
+Then restart your niri session and verify:
+
+```bash
+niri msg --json windows | jq '.[0].layout.tile_pos_in_workspace_view'
+```
+
+It should return coordinates, not `null`.
 
 ## Contributing
 
