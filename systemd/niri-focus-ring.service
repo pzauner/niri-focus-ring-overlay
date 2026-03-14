@@ -1,0 +1,13 @@
+[Unit]
+Description=Animated external focus ring overlay for niri
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/niri-focus-ring-daemon.py
+Restart=always
+RestartSec=0.5
+
+[Install]
+WantedBy=default.target
